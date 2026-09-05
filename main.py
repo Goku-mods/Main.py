@@ -31,9 +31,6 @@ ADMIN_ID = 8754266926
 REWARD_PER_REFERRAL = 1
 MIN_WITHDRAWAL = 20
 
-# IMPORTANT:
-# DO NOT DELETE OR REPLACE bot.db.
-# Existing users/referrals/balances are stored there.
 DB_FILE = "bot.db"
 
 
@@ -63,6 +60,7 @@ BOT_TOKEN = get_bot_token()
 
 # ============================================================
 # REQUIRED CHANNELS / GROUPS
+# CHAT IDS ARE EXACTLY THE ONES YOU PROVIDED
 # ============================================================
 
 REQUIRED_CHATS = [
@@ -129,7 +127,6 @@ def init_db():
     conn = db()
     cur = conn.cursor()
 
-    # Existing table is NOT dropped.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -156,7 +153,6 @@ def init_db():
         )
     """)
 
-    # Safe migration for old bot.db.
     cols = {
         row["name"]
         for row in cur.execute(
@@ -179,12 +175,10 @@ def init_db():
 
 def get_user(user_id):
     conn = db()
-
     row = conn.execute(
         "SELECT * FROM users WHERE user_id=?",
         (user_id,),
     ).fetchone()
-
     conn.close()
     return row
 
@@ -194,7 +188,6 @@ def create_user(tg_user, referred_by=None):
 
     if existing:
         conn = db()
-
         conn.execute(
             """
             UPDATE users
@@ -207,7 +200,6 @@ def create_user(tg_user, referred_by=None):
                 tg_user.id,
             ),
         )
-
         conn.commit()
 
         row = conn.execute(
@@ -260,12 +252,10 @@ def create_user(tg_user, referred_by=None):
 
 def set_upi(user_id, upi):
     conn = db()
-
     conn.execute(
         "UPDATE users SET upi_id=? WHERE user_id=?",
         (upi, user_id),
     )
-
     conn.commit()
     conn.close()
 
@@ -298,7 +288,6 @@ def add_referral_reward(referrer_id, referred_id):
         conn.close()
         return False
 
-    # Prevent duplicate referral rewards.
     if row["referral_paid"] == 1:
         conn.close()
         return False
@@ -309,10 +298,7 @@ def add_referral_reward(referrer_id, referred_id):
         SET points=points+?
         WHERE user_id=?
         """,
-        (
-            REWARD_PER_REFERRAL,
-            referrer_id,
-        ),
+        (REWARD_PER_REFERRAL, referrer_id),
     )
 
     cur.execute(
@@ -466,9 +452,7 @@ async def resolve_chat_id(bot, chat):
 
     try:
         info = await bot.get_chat(raw)
-
         RUNTIME_CHAT_IDS[name] = info.id
-
         return info.id
 
     except TelegramError as exc:
@@ -479,8 +463,9 @@ async def resolve_chat_id(bot, chat):
             exc,
         )
 
+        # Keep original value. This is important for
+        # @lxmodemenu and already-correct numeric IDs.
         RUNTIME_CHAT_IDS[name] = raw
-
         return raw
 
 
@@ -743,6 +728,8 @@ async def verify_join(update, context):
             "<b>Verify Joined</b> again."
         )
 
+        # Show useful Telegram errors only in logs,
+        # not as ugly API text to users.
         for name, error in errors.items():
             logger.warning(
                 "Verification detail | %s | %s",
@@ -838,6 +825,7 @@ async def handle_chat_member(update, context):
         cm.new_chat_member
     )
 
+    # Only react to an actual join/change-to-member.
     if not new_joined or old_joined:
         return
 
@@ -870,6 +858,8 @@ async def handle_chat_member(update, context):
         user.id,
     )
 
+    # As soon as the last required chat is joined,
+    # referral is credited and menu is sent.
     if not missing:
         await maybe_reward_user(
             context.bot,
@@ -884,7 +874,6 @@ async def handle_chat_member(update, context):
                 parse_mode="HTML",
                 reply_markup=MAIN_KEYBOARD,
             )
-
         except Exception as exc:
             logger.warning(
                 "Could not send instant menu: %s",
@@ -1090,10 +1079,6 @@ async def withdrawal(update, context):
         )
 
 
-# ============================================================
-# CREATE WITHDRAWAL
-# ============================================================
-
 async def create_withdrawal(
     bot,
     user_id,
@@ -1255,6 +1240,7 @@ async def withdrawal_callback(
         return
 
     if query.data == "wd_use_saved":
+
         user = get_user(
             query.from_user.id
         )
@@ -1312,6 +1298,196 @@ async def help_menu(update, context):
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD,
     )
+
+
+# ============================================================
+# TEXT HANDLER
+# IMPORTANT FIX:
+# MENU BUTTONS ARE HANDLED BEFORE JOIN GATE
+# ============================================================
+
+async def handle_text(update, context):
+    if not update.message:
+        return
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    text = (
+        update.message.text or ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # BACK ALWAYS WORKS
+    # --------------------------------------------------------
+
+    if text == "⬅️ Back":
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "🏠 <b>Main Menu</b>",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # --------------------------------------------------------
+    # HELP ALWAYS WORKS
+    # --------------------------------------------------------
+
+    if text == "🆘 Help":
+        await help_menu(
+            update,
+            context,
+        )
+        return
+
+    # --------------------------------------------------------
+    # UPI BIND INPUT MUST BE CHECKED BEFORE GATE
+    # --------------------------------------------------------
+
+    if context.user_data.get("upi_step") == "bind":
+        upi = text
+
+        if not valid_upi(upi):
+            await update.message.reply_text(
+                "❌ Invalid UPI ID.\n\n"
+                "Example: <code>name@upi</code>",
+                parse_mode="HTML",
+                reply_markup=BACK_KEYBOARD,
+            )
+            return
+
+        set_upi(user.id, upi)
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "✅ <b>UPI Bound Successfully</b>\n\n"
+            f"UPI: <code>{upi}</code>\n\n"
+            "Your UPI is now saved for future withdrawals.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # --------------------------------------------------------
+    # WITHDRAWAL INPUT MUST BE CHECKED BEFORE GATE
+    # --------------------------------------------------------
+
+    if context.user_data.get(
+        "withdrawal_step"
+    ) == "upi":
+
+        upi = text
+
+        if not valid_upi(upi):
+            await update.message.reply_text(
+                "❌ Invalid UPI ID.\n\n"
+                "Example: <code>name@upi</code>",
+                parse_mode="HTML",
+                reply_markup=BACK_KEYBOARD,
+            )
+            return
+
+        set_upi(
+            user.id,
+            upi,
+        )
+
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            "✅ <b>UPI Bound Successfully</b>\n\n"
+            f"UPI: <code>{upi}</code>\n\n"
+            "Now tap <b>Withdrawal</b> to submit your request.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # --------------------------------------------------------
+    # MAIN MENU BUTTONS
+    # --------------------------------------------------------
+
+    if text in {
+        "👥 Refer Friend",
+        "💰 Points",
+        "💳 Bind UPI",
+        "💸 Withdrawal",
+    }:
+
+        missing, _ = await gate_user(
+            context.bot,
+            user.id,
+        )
+
+        if missing:
+            await send_join_screen(
+                update,
+                missing,
+            )
+            return
+
+        if text == "👥 Refer Friend":
+            await refer_friend(
+                update,
+                context,
+            )
+            return
+
+        if text == "💰 Points":
+            await points(
+                update,
+                context,
+            )
+            return
+
+        if text == "💳 Bind UPI":
+            await bind_upi(
+                update,
+                context,
+            )
+            return
+
+        if text == "💸 Withdrawal":
+            await withdrawal(
+                update,
+                context,
+            )
+            return
+
+    # --------------------------------------------------------
+    # RANDOM MESSAGE
+    # --------------------------------------------------------
+    #
+    # If user sends any random message:
+    # 1. Check joins
+    # 2. If missing -> show missing chats + buttons
+    # 3. If all joined -> show main menu
+    # --------------------------------------------------------
+
+    missing, _ = await gate_user(
+        context.bot,
+        user.id,
+    )
+
+    if missing:
+        await send_join_screen(
+            update,
+            missing,
+        )
+        return
+
+    await update.message.reply_text(
+        "🏠 <b>Main Menu</b>\n\n"
+        "Choose an option below:",
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
 # ============================================================
 # ADMIN
 # ============================================================
@@ -1333,6 +1509,7 @@ def withdrawal_rows(
             """,
             (status, limit),
         ).fetchall()
+
     else:
         rows = conn.execute(
             """
@@ -1381,116 +1558,6 @@ def format_withdrawal(row):
     )
 
 
-def admin_users_text(limit=25):
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT
-            user_id,
-            username,
-            first_name,
-            points,
-            referred_by,
-            referral_paid,
-            upi_id,
-            joined_at
-        FROM users
-        ORDER BY joined_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-        return (
-            "👥 <b>Users</b>\n\n"
-            "No users found."
-        )
-
-    parts = [
-        "👥 <b>Users</b>",
-        "",
-    ]
-
-    for row in rows:
-        username = (
-            f"@{row['username']}"
-            if row["username"]
-            else "No username"
-        )
-
-        parts.append(
-            f"👤 {row['first_name'] or 'Unknown'} "
-            f"({username})\n"
-            f"ID: <code>{row['user_id']}</code>\n"
-            f"Balance: ₹{row['points']}\n"
-            f"UPI: <code>{row['upi_id'] or '-'}</code>\n"
-            f"Referred by: "
-            f"<code>{row['referred_by'] or '-'}</code>\n"
-            f"Referral paid: "
-            f"{'Yes' if row['referral_paid'] else 'No'}"
-        )
-
-        parts.append("")
-
-    return "\n".join(parts)
-
-
-def admin_referrals_text(limit=30):
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT
-            r.user_id AS referred_id,
-            r.referred_by AS referrer_id,
-            r.referral_paid,
-            r.username,
-            r.first_name
-        FROM users r
-        WHERE r.referred_by IS NOT NULL
-        ORDER BY r.joined_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-        return (
-            "🔗 <b>Referrals</b>\n\n"
-            "No referrals found."
-        )
-
-    parts = [
-        "🔗 <b>Referral Records</b>",
-        "",
-    ]
-
-    for row in rows:
-        status = (
-            "Paid"
-            if row["referral_paid"]
-            else "Pending"
-        )
-
-        parts.append(
-            f"Referred user: "
-            f"<code>{row['referred_id']}</code>\n"
-            f"Referrer: "
-            f"<code>{row['referrer_id']}</code>\n"
-            f"Reward: {status}"
-        )
-
-        parts.append("")
-
-    return "\n".join(parts)
-
-
 async def admin_command(update, context):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text(
@@ -1506,6 +1573,73 @@ async def admin_command(update, context):
     )
 
 
+def admin_users_text(limit=25):
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT user_id, username, first_name, points,
+               referred_by, referral_paid, upi_id, joined_at
+        FROM users
+        ORDER BY joined_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return "👥 <b>Users</b>\\n\\nNo users found."
+
+    parts = ["👥 <b>Users</b>", ""]
+    for row in rows:
+        username = f"@{row['username']}" if row["username"] else "No username"
+        parts.append(
+            f"👤 {row['first_name'] or 'Unknown'} ({username})\\n"
+            f"ID: <code>{row['user_id']}</code>\\n"
+            f"Balance: ₹{row['points']}\\n"
+            f"UPI: <code>{row['upi_id'] or '-'}</code>\\n"
+            f"Referred by: <code>{row['referred_by'] or '-'}</code>\\n"
+            f"Referral paid: {'Yes' if row['referral_paid'] else 'No'}"
+        )
+        parts.append("")
+
+    return "\\n".join(parts)
+
+
+def admin_referrals_text(limit=30):
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT r.user_id AS referred_id,
+               r.referred_by AS referrer_id,
+               r.referral_paid,
+               r.username,
+               r.first_name
+        FROM users r
+        WHERE r.referred_by IS NOT NULL
+        ORDER BY r.joined_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return "🔗 <b>Referrals</b>\\n\\nNo referrals found."
+
+    parts = ["🔗 <b>Referral Records</b>", ""]
+    for row in rows:
+        status = "Paid" if row["referral_paid"] else "Pending"
+        parts.append(
+            f"Referred user: <code>{row['referred_id']}</code>\\n"
+            f"Referrer: <code>{row['referrer_id']}</code>\\n"
+            f"Reward: {status}"
+        )
+        parts.append("")
+
+    return "\\n".join(parts)
+
+
 async def admin_callback(update, context):
     query = update.callback_query
 
@@ -1518,10 +1652,6 @@ async def admin_callback(update, context):
 
     await query.answer()
 
-    # --------------------------------------------------------
-    # PENDING
-    # --------------------------------------------------------
-
     if query.data == "admin_pending":
 
         rows = withdrawal_rows(
@@ -1533,7 +1663,6 @@ async def admin_callback(update, context):
                 "📥 <b>Pending Withdrawals</b>\n\n"
                 "No pending requests."
             )
-
         else:
             text = (
                 "📥 <b>Pending Withdrawals</b>\n\n"
@@ -1542,10 +1671,6 @@ async def admin_callback(update, context):
                     for row in rows
                 )
             )
-
-    # --------------------------------------------------------
-    # ALL
-    # --------------------------------------------------------
 
     elif query.data == "admin_all":
 
@@ -1556,7 +1681,6 @@ async def admin_callback(update, context):
                 "📋 <b>All Withdrawals</b>\n\n"
                 "No requests."
             )
-
         else:
             text = (
                 "📋 <b>All Withdrawals</b>\n\n"
@@ -1565,10 +1689,6 @@ async def admin_callback(update, context):
                     for row in rows
                 )
             )
-
-    # --------------------------------------------------------
-    # COMPLETED
-    # --------------------------------------------------------
 
     elif query.data == "admin_completed":
 
@@ -1581,7 +1701,6 @@ async def admin_callback(update, context):
                 "✅ <b>Completed Withdrawals</b>\n\n"
                 "No completed requests."
             )
-
         else:
             text = (
                 "✅ <b>Completed Withdrawals</b>\n\n"
@@ -1591,44 +1710,18 @@ async def admin_callback(update, context):
                 )
             )
 
-    # --------------------------------------------------------
-    # USERS
-    # --------------------------------------------------------
-
     elif query.data == "admin_users":
-
         text = admin_users_text()
 
-    # --------------------------------------------------------
-    # REFERRALS
-    # --------------------------------------------------------
-
     elif query.data == "admin_referrals":
-
         text = admin_referrals_text()
-
-    # --------------------------------------------------------
-    # STATS
-    # --------------------------------------------------------
 
     elif query.data == "admin_stats":
 
         conn = db()
 
         users = conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM users
-            """
-        ).fetchone()["n"]
-
-        referrals = conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM users
-            WHERE referred_by IS NOT NULL
-            AND referral_paid=1
-            """
+            "SELECT COUNT(*) AS n FROM users"
         ).fetchone()["n"]
 
         pending = conn.execute(
@@ -1647,40 +1740,11 @@ async def admin_callback(update, context):
             """
         ).fetchone()["n"]
 
-        rejected = conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM withdrawals
-            WHERE status='rejected'
-            """
-        ).fetchone()["n"]
-
         total_completed = conn.execute(
             """
-            SELECT COALESCE(
-                SUM(amount), 0
-            ) AS n
+            SELECT COALESCE(SUM(amount), 0) AS n
             FROM withdrawals
             WHERE status='completed'
-            """
-        ).fetchone()["n"]
-
-        total_pending = conn.execute(
-            """
-            SELECT COALESCE(
-                SUM(amount), 0
-            ) AS n
-            FROM withdrawals
-            WHERE status='pending'
-            """
-        ).fetchone()["n"]
-
-        total_rewards = conn.execute(
-            """
-            SELECT COALESCE(
-                SUM(points), 0
-            ) AS n
-            FROM users
             """
         ).fetchone()["n"]
 
@@ -1688,19 +1752,11 @@ async def admin_callback(update, context):
 
         text = (
             "📊 <b>Bot Stats</b>\n\n"
-            f"👥 Users: <b>{users}</b>\n"
-            f"🔗 Successful referrals: "
-            f"<b>{referrals}</b>\n\n"
-            f"📥 Pending withdrawals: "
-            f"<b>{pending}</b>\n"
-            f"💰 Pending amount: "
-            f"<b>₹{total_pending}</b>\n"
-            f"✅ Completed withdrawals: "
-            f"<b>{completed}</b>\n"
-            f"💵 Completed amount: "
-            f"<b>₹{total_completed}</b>\n"
-            f"❌ Rejected withdrawals: "
-            f"<b>{rejected}</b>"
+            f"Users: <b>{users}</b>\n"
+            f"Pending withdrawals: <b>{pending}</b>\n"
+            f"Completed withdrawals: <b>{completed}</b>\n"
+            f"Completed amount: "
+            f"<b>₹{total_completed}</b>"
         )
 
     else:
@@ -1763,7 +1819,6 @@ async def admin_withdrawal_action(
         await query.edit_message_text(
             "❌ Withdrawal not found."
         )
-
         return
 
     if row["status"] != "pending":
@@ -1773,7 +1828,6 @@ async def admin_withdrawal_action(
             f"Already {row['status']}.",
             show_alert=True,
         )
-
         return
 
     # --------------------------------------------------------
@@ -1826,7 +1880,6 @@ async def admin_withdrawal_action(
                 parse_mode="HTML",
                 reply_markup=MAIN_KEYBOARD,
             )
-
         except Exception:
             pass
 
@@ -1853,7 +1906,7 @@ async def admin_withdrawal_action(
             ),
         )
 
-        # Return money to user's balance.
+        # Return amount to user balance.
         conn.execute(
             """
             UPDATE users
@@ -1887,7 +1940,6 @@ async def admin_withdrawal_action(
                 parse_mode="HTML",
                 reply_markup=MAIN_KEYBOARD,
             )
-
         except Exception:
             pass
 
@@ -1915,13 +1967,9 @@ def main():
 
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN environment variable missing. "
-            "Set BOT_TOKEN in Railway Variables."
+            "BOT_TOKEN environment variable missing."
         )
 
-    # IMPORTANT:
-    # This only creates missing tables/columns.
-    # It does NOT delete existing database data.
     init_db()
 
     app = (
@@ -1931,10 +1979,7 @@ def main():
         .build()
     )
 
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
+    # Commands
     app.add_handler(
         CommandHandler(
             "start",
@@ -1956,10 +2001,7 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # VERIFY JOIN
-    # --------------------------------------------------------
-
+    # Verify join button
     app.add_handler(
         CallbackQueryHandler(
             verify_join,
@@ -1967,39 +2009,23 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # WITHDRAWAL + UPI CALLBACKS
-    # --------------------------------------------------------
-
+    # Withdrawal callbacks
     app.add_handler(
         CallbackQueryHandler(
             withdrawal_callback,
-            pattern=(
-                r"^(wd_(use_saved|change_upi|cancel)"
-                r"|upi_(change|cancel))$"
-            ),
+            pattern=r"^(wd_(use_saved|change_upi|cancel)|upi_(change|cancel))$",
         )
     )
 
-    # --------------------------------------------------------
-    # ADMIN PANEL
-    # --------------------------------------------------------
-
+    # Admin panel
     app.add_handler(
         CallbackQueryHandler(
             admin_callback,
-            pattern=(
-                r"^admin_"
-                r"(pending|all|completed|stats|"
-                r"users|referrals)$"
-            ),
+            pattern=r"^admin_(pending|all|completed|stats|users|referrals)$",
         )
     )
 
-    # --------------------------------------------------------
-    # ADMIN COMPLETE / REJECT
-    # --------------------------------------------------------
-
+    # Admin complete/reject
     app.add_handler(
         CallbackQueryHandler(
             admin_withdrawal_action,
@@ -2007,10 +2033,7 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # INSTANT MEMBERSHIP UPDATES
-    # --------------------------------------------------------
-
+    # Instant membership updates
     app.add_handler(
         ChatMemberHandler(
             handle_chat_member,
@@ -2018,10 +2041,7 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # NORMAL TEXT
-    # --------------------------------------------------------
-
+    # Normal text / keyboard
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -2036,31 +2056,26 @@ def main():
     logger.info(
         "========================================"
     )
-
     logger.info(
         "GOKU REFERRAL BOT ONLINE"
     )
-
     logger.info(
         "Required chats: %d",
         len(REQUIRED_CHATS),
     )
-
     logger.info(
         "Reward: ₹%s",
         REWARD_PER_REFERRAL,
     )
-
     logger.info(
         "Minimum withdrawal: ₹%s",
         MIN_WITHDRAWAL,
     )
-
     logger.info(
         "========================================"
     )
 
-    # ChatMemberHandler requires ALL_TYPES.
+    # ALL_TYPES is required for ChatMemberHandler.
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
