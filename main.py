@@ -9,6 +9,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
 )
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,13 +23,61 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-# Hosting/Environment Variables ma BOT_TOKEN set karo
-BOT_TOKEN = os.getenv("8849206316:AAEAl8qRiQkzmOSkVPwMBfzBxrNl9jliBXQ")
-
 ADMIN_ID = 8754266926
 
 REWARD_PER_REFERRAL = 1
 MIN_WITHDRAWAL = 20
+
+DB_FILE = "bot.db"
+
+# ============================================================
+# RAILWAY BOT TOKEN
+# ============================================================
+
+def get_bot_token():
+    """
+    Railway environment variable mathi token safely read kare che.
+
+    Preferred:
+        BOT_TOKEN
+
+    Fallback:
+        TELEGRAM_BOT_TOKEN
+        TOKEN
+
+    Case/space issue hoy to matching key pan try kare che.
+    """
+
+    possible_names = [
+        "BOT_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "TOKEN",
+    ]
+
+    # Normal lookup
+    for name in possible_names:
+        value = os.getenv(name)
+        if value:
+            value = value.strip()
+            if value:
+                return value
+
+    # Extra fallback:
+    # Jo Railway variable name ma accidental lowercase/space hoy
+    for key, value in os.environ.items():
+        normalized = key.strip().upper()
+
+        if normalized in possible_names:
+            value = (value or "").strip()
+
+            if value:
+                return value
+
+    return None
+
+
+BOT_TOKEN = get_bot_token()
+
 
 # ============================================================
 # REQUIRED CHANNELS / GROUPS
@@ -67,7 +116,6 @@ REQUIRED_CHATS = [
     },
 ]
 
-DB_FILE = "bot.db"
 
 # ============================================================
 # LOGGING
@@ -78,7 +126,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("referral_bot")
 
 
 # ============================================================
@@ -86,8 +134,13 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(
+        DB_FILE,
+        timeout=30,
+    )
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
@@ -102,8 +155,8 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
             points INTEGER NOT NULL DEFAULT 0,
             referral_code TEXT UNIQUE NOT NULL,
             referred_by INTEGER,
@@ -127,16 +180,27 @@ def init_db():
     conn.commit()
     conn.close()
 
+    logger.info("SQLite database initialized.")
+
+
+# ============================================================
+# USER FUNCTIONS
+# ============================================================
 
 def get_user(user_id):
     conn = db()
 
     row = conn.execute(
-        "SELECT * FROM users WHERE user_id = ?",
+        """
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+        """,
         (user_id,),
     ).fetchone()
 
     conn.close()
+
     return row
 
 
@@ -145,16 +209,20 @@ def make_referral_code(user_id):
 
 
 def create_user(tg_user, referred_by=None):
+
     existing = get_user(tg_user.id)
 
     if existing:
         return existing, False
 
-    referral_code = make_referral_code(tg_user.id)
+    referral_code = make_referral_code(
+        tg_user.id
+    )
 
     conn = db()
 
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO users (
             user_id,
             username,
@@ -166,19 +234,25 @@ def create_user(tg_user, referred_by=None):
             joined_at
         )
         VALUES (?, ?, ?, 0, ?, ?, 0, ?)
-    """, (
-        tg_user.id,
-        tg_user.username or "",
-        tg_user.first_name or "",
-        referral_code,
-        referred_by,
-        now(),
-    ))
+        """,
+        (
+            tg_user.id,
+            tg_user.username or "",
+            tg_user.first_name or "",
+            referral_code,
+            referred_by,
+            now(),
+        ),
+    )
 
     conn.commit()
 
     row = conn.execute(
-        "SELECT * FROM users WHERE user_id = ?",
+        """
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+        """,
         (tg_user.id,),
     ).fetchone()
 
@@ -187,14 +261,22 @@ def create_user(tg_user, referred_by=None):
     return row, True
 
 
-def add_referral_reward(referrer_id, referred_id):
+# ============================================================
+# REFERRAL REWARD
+# ============================================================
+
+def add_referral_reward(
+    referrer_id,
+    referred_id,
+):
+
     if referrer_id == referred_id:
         return False
 
     conn = db()
     cur = conn.cursor()
 
-    referred = cur.execute(
+    user = cur.execute(
         """
         SELECT referred_by, referral_paid
         FROM users
@@ -203,15 +285,15 @@ def add_referral_reward(referrer_id, referred_id):
         (referred_id,),
     ).fetchone()
 
-    if not referred:
+    if not user:
         conn.close()
         return False
 
-    if referred["referred_by"] != referrer_id:
+    if user["referred_by"] != referrer_id:
         conn.close()
         return False
 
-    if referred["referral_paid"]:
+    if user["referral_paid"] == 1:
         conn.close()
         return False
 
@@ -221,7 +303,10 @@ def add_referral_reward(referrer_id, referred_id):
         SET points = points + ?
         WHERE user_id = ?
         """,
-        (REWARD_PER_REFERRAL, referrer_id),
+        (
+            REWARD_PER_REFERRAL,
+            referrer_id,
+        ),
     )
 
     cur.execute(
@@ -251,31 +336,38 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
 BACK_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["⬅️ Back"]
+        ["⬅️ Back"],
     ],
     resize_keyboard=True,
 )
 
 
 def join_keyboard():
+
     rows = []
 
     for chat in REQUIRED_CHATS:
-        rows.append([
-            InlineKeyboardButton(
-                f"📢 Join {chat['name']}",
-                url=chat["join_url"],
-            )
-        ])
 
-    rows.append([
-        InlineKeyboardButton(
-            "✅ Verify Joined",
-            callback_data="verify_join",
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📢 Join {chat['name']}",
+                    url=chat["join_url"],
+                )
+            ]
         )
-    ])
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✅ Verify Joined",
+                callback_data="verify_join",
+            )
+        ]
+    )
 
     return InlineKeyboardMarkup(rows)
 
@@ -284,22 +376,30 @@ def join_keyboard():
 # MEMBERSHIP CHECK
 # ============================================================
 
-async def is_member(bot, user_id, chat_id):
+async def is_member(
+    bot,
+    user_id,
+    chat_id,
+):
+
     try:
+
         member = await bot.get_chat_member(
             chat_id=chat_id,
             user_id=user_id,
         )
 
-        return member.status in (
-            "member",
-            "administrator",
-            "creator",
-        )
+        return member.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        }
 
     except Exception as exc:
+
         logger.warning(
-            "Membership check failed | chat=%s | user=%s | error=%s",
+            "Membership check failed | "
+            "chat=%s | user=%s | %s",
             chat_id,
             user_id,
             exc,
@@ -308,27 +408,35 @@ async def is_member(bot, user_id, chat_id):
         return False
 
 
-async def all_required_joined(bot, user_id):
+async def all_required_joined(
+    bot,
+    user_id,
+):
+
     for chat in REQUIRED_CHATS:
-        if not await is_member(
+
+        joined = await is_member(
             bot,
             user_id,
             chat["chat_id"],
-        ):
+        )
+
+        if not joined:
             return False
 
     return True
 
 
 # ============================================================
-# REFERRAL
+# REFERRAL CODE
 # ============================================================
 
 def extract_referrer(args):
+
     if not args:
         return None
 
-    value = args[0].strip().upper()
+    value = str(args[0]).strip().upper()
 
     if not value.startswith("REF"):
         return None
@@ -343,22 +451,29 @@ def extract_referrer(args):
 # JOIN SCREEN
 # ============================================================
 
-async def send_join_screen(update, context):
+async def send_join_screen(
+    update,
+    context,
+):
+
     text = (
         "🔒 *MUST JOIN ALL*\n\n"
         "Bot use karva pela badha required "
         "channels/groups join karo.\n\n"
-        "Badha join karya pachhi "
+        "Badha join karya pachhi niche "
         "*Verify Joined* dabavo."
     )
 
     if update.callback_query:
+
         await update.callback_query.message.reply_text(
             text,
             parse_mode="Markdown",
             reply_markup=join_keyboard(),
         )
-    else:
+
+    elif update.message:
+
         await update.message.reply_text(
             text,
             parse_mode="Markdown",
@@ -370,7 +485,11 @@ async def send_join_screen(update, context):
 # START
 # ============================================================
 
-async def start(update, context):
+async def start(
+    update,
+    context,
+):
+
     user = update.effective_user
 
     if not user:
@@ -380,7 +499,9 @@ async def start(update, context):
         context.args
     )
 
-    existing = get_user(user.id)
+    existing = get_user(
+        user.id
+    )
 
     if not existing:
 
@@ -388,6 +509,7 @@ async def start(update, context):
             referrer_id = None
 
         elif referrer_id:
+
             if not get_user(referrer_id):
                 referrer_id = None
 
@@ -404,10 +526,12 @@ async def start(update, context):
     )
 
     if not joined:
+
         await send_join_screen(
             update,
             context,
         )
+
         return
 
     # Referral reward
@@ -419,16 +543,24 @@ async def start(update, context):
         )
 
         if rewarded:
+
             try:
+
                 await context.bot.send_message(
                     existing["referred_by"],
                     "🎉 *New Referral!*\n\n"
-                    f"💰 You earned +{REWARD_PER_REFERRAL} "
-                    f"point (₹{REWARD_PER_REFERRAL}).",
+                    f"💰 You earned "
+                    f"+{REWARD_PER_REFERRAL} point "
+                    f"(₹{REWARD_PER_REFERRAL}).",
                     parse_mode="Markdown",
                 )
-            except Exception:
-                pass
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Referral notification failed: %s",
+                    exc,
+                )
 
     await update.message.reply_text(
         "🎉 *Welcome!*\n\n"
@@ -443,7 +575,11 @@ async def start(update, context):
 # VERIFY JOIN
 # ============================================================
 
-async def verify_join(update, context):
+async def verify_join(
+    update,
+    context,
+):
+
     query = update.callback_query
 
     await query.answer()
@@ -479,13 +615,16 @@ async def verify_join(update, context):
         if rewarded:
 
             try:
+
                 await context.bot.send_message(
                     user["referred_by"],
                     "🎉 *New Referral!*\n\n"
-                    f"💰 You earned +{REWARD_PER_REFERRAL} "
-                    f"point (₹{REWARD_PER_REFERRAL}).",
+                    f"💰 You earned "
+                    f"+{REWARD_PER_REFERRAL} point "
+                    f"(₹{REWARD_PER_REFERRAL}).",
                     parse_mode="Markdown",
                 )
+
             except Exception:
                 pass
 
@@ -501,7 +640,11 @@ async def verify_join(update, context):
 # REFER FRIEND
 # ============================================================
 
-async def refer_friend(update, context):
+async def refer_friend(
+    update,
+    context,
+):
+
     user = get_user(
         update.effective_user.id
     )
@@ -510,6 +653,15 @@ async def refer_friend(update, context):
         return
 
     me = await context.bot.get_me()
+
+    if not me.username:
+
+        await update.message.reply_text(
+            "❌ Bot username unavailable.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+        return
 
     link = (
         f"https://t.me/{me.username}"
@@ -539,7 +691,11 @@ async def refer_friend(update, context):
 # POINTS
 # ============================================================
 
-async def points(update, context):
+async def points(
+    update,
+    context,
+):
+
     user = get_user(
         update.effective_user.id
     )
@@ -551,13 +707,13 @@ async def points(update, context):
 
     referral_count = conn.execute(
         """
-        SELECT COUNT(*) AS c
+        SELECT COUNT(*) AS total
         FROM users
         WHERE referred_by = ?
         AND referral_paid = 1
         """,
         (user["user_id"],),
-    ).fetchone()["c"]
+    ).fetchone()["total"]
 
     conn.close()
 
@@ -574,10 +730,14 @@ async def points(update, context):
 
 
 # ============================================================
-# WITHDRAWAL START
+# WITHDRAWAL
 # ============================================================
 
-async def withdrawal(update, context):
+async def withdrawal(
+    update,
+    context,
+):
+
     user = get_user(
         update.effective_user.id
     )
@@ -619,12 +779,19 @@ async def withdrawal(update, context):
 # HELP
 # ============================================================
 
-async def help_menu(update, context):
+async def help_menu(
+    update,
+    context,
+):
+
     await update.message.reply_text(
         "🆘 *Help*\n\n"
-        "👥 Refer Friend → Personal referral link.\n"
-        "💰 Points → Balance ane referrals.\n"
-        f"💸 Withdrawal → Minimum ₹{MIN_WITHDRAWAL}.\n\n"
+        "👥 Refer Friend → "
+        "Personal referral link male.\n"
+        "💰 Points → "
+        "Balance ane referrals check karo.\n"
+        f"💸 Withdrawal → "
+        f"Minimum ₹{MIN_WITHDRAWAL}.\n\n"
         "Referral reward successful "
         "join verification pachhi credit thay che.",
         parse_mode="Markdown",
@@ -636,7 +803,11 @@ async def help_menu(update, context):
 # TEXT HANDLER
 # ============================================================
 
-async def handle_text(update, context):
+async def handle_text(
+    update,
+    context,
+):
+
     if not update.message:
         return
 
@@ -646,32 +817,41 @@ async def handle_text(update, context):
 
     user_id = update.effective_user.id
 
+    # Menu
     if text == "👥 Refer Friend":
+
         await refer_friend(
             update,
             context,
         )
+
         return
 
     if text == "💰 Points":
+
         await points(
             update,
             context,
         )
+
         return
 
     if text == "💸 Withdrawal":
+
         await withdrawal(
             update,
             context,
         )
+
         return
 
     if text == "🆘 Help":
+
         await help_menu(
             update,
             context,
         )
+
         return
 
     if text == "⬅️ Back":
@@ -686,7 +866,7 @@ async def handle_text(update, context):
         return
 
     # ========================================================
-    # UPI
+    # UPI INPUT
     # ========================================================
 
     if context.user_data.get(
@@ -710,7 +890,9 @@ async def handle_text(update, context):
 
             return
 
-        user = get_user(user_id)
+        user = get_user(
+            user_id
+        )
 
         if (
             not user
@@ -731,6 +913,7 @@ async def handle_text(update, context):
         conn = db()
         cur = conn.cursor()
 
+        # Atomically reserve balance
         cur.execute(
             """
             UPDATE users
@@ -750,13 +933,13 @@ async def handle_text(update, context):
             conn.rollback()
             conn.close()
 
+            context.user_data.clear()
+
             await update.message.reply_text(
                 "❌ Withdrawal create "
                 "thai shakyo nahi.",
                 reply_markup=MAIN_KEYBOARD,
             )
-
-            context.user_data.clear()
 
             return
 
@@ -769,9 +952,7 @@ async def handle_text(update, context):
                 status,
                 created_at
             )
-            VALUES (
-                ?, ?, ?, 'pending', ?
-            )
+            VALUES (?, ?, ?, 'pending', ?)
             """,
             (
                 user_id,
@@ -803,22 +984,24 @@ async def handle_text(update, context):
         # ADMIN BUTTONS
         # ====================================================
 
-        admin_keyboard = InlineKeyboardMarkup([
+        admin_keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    "✅ Approve",
-                    callback_data=(
-                        f"wd_approve_{withdrawal_id}"
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve",
+                        callback_data=(
+                            f"wd_approve_{withdrawal_id}"
+                        ),
                     ),
-                ),
-                InlineKeyboardButton(
-                    "❌ Reject",
-                    callback_data=(
-                        f"wd_reject_{withdrawal_id}"
+                    InlineKeyboardButton(
+                        "❌ Reject",
+                        callback_data=(
+                            f"wd_reject_{withdrawal_id}"
+                        ),
                     ),
-                ),
+                ]
             ]
-        ])
+        )
 
         username = (
             f"@{user['username']}"
@@ -843,7 +1026,7 @@ async def handle_text(update, context):
         except Exception as exc:
 
             logger.error(
-                "Could not notify admin: %s",
+                "Admin notification failed: %s",
                 exc,
             )
 
@@ -859,7 +1042,11 @@ async def handle_text(update, context):
 # ADMIN WITHDRAWAL ACTION
 # ============================================================
 
-async def withdrawal_action(update, context):
+async def withdrawal_action(
+    update,
+    context,
+):
+
     query = update.callback_query
 
     if query.from_user.id != ADMIN_ID:
@@ -985,6 +1172,7 @@ async def withdrawal_action(update, context):
             ),
         )
 
+        # Return reserved points
         conn.execute(
             """
             UPDATE users
@@ -1025,9 +1213,13 @@ async def withdrawal_action(update, context):
 # ERROR HANDLER
 # ============================================================
 
-async def error_handler(update, context):
+async def error_handler(
+    update,
+    context,
+):
+
     logger.error(
-        "Unhandled exception",
+        "Unhandled exception:",
         exc_info=context.error,
     )
 
@@ -1038,21 +1230,51 @@ async def error_handler(update, context):
 
 def main():
 
+    # --------------------------------------------------------
+    # TOKEN CHECK
+    # --------------------------------------------------------
+
     if not BOT_TOKEN:
+
         raise RuntimeError(
-            "BOT_TOKEN environment variable missing. "
-            "Hosting ma BOT_TOKEN set karo."
+            "\n"
+            "BOT TOKEN NOT FOUND!\n\n"
+            "Railway Variables ma aa exact variable add karo:\n"
+            "BOT_TOKEN = YOUR_NEW_BOTFATHER_TOKEN\n\n"
+            "Pachhi NEW DEPLOYMENT / REDEPLOY karo.\n"
         )
 
+    # Token accidentally wrapped in quotes hoy to clean
+    token = BOT_TOKEN.strip().strip('"').strip("'")
+
+    if not token:
+
+        raise RuntimeError(
+            "BOT_TOKEN is empty."
+        )
+
+    logger.info(
+        "BOT_TOKEN loaded successfully."
+    )
+
+    # --------------------------------------------------------
+    # DATABASE
+    # --------------------------------------------------------
+
     init_db()
+
+    # --------------------------------------------------------
+    # TELEGRAM APPLICATION
+    # --------------------------------------------------------
 
     app = (
         Application
         .builder()
-        .token(BOT_TOKEN)
+        .token(token)
         .build()
     )
 
+    # /start
     app.add_handler(
         CommandHandler(
             "start",
@@ -1060,6 +1282,7 @@ def main():
         )
     )
 
+    # Verify Joined
     app.add_handler(
         CallbackQueryHandler(
             verify_join,
@@ -1067,6 +1290,7 @@ def main():
         )
     )
 
+    # Admin withdrawal
     app.add_handler(
         CallbackQueryHandler(
             withdrawal_action,
@@ -1074,6 +1298,7 @@ def main():
         )
     )
 
+    # Text/menu
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1081,18 +1306,45 @@ def main():
         )
     )
 
+    # Errors
     app.add_error_handler(
         error_handler
     )
 
     logger.info(
-        "Referral earning bot started."
+        "========================================"
     )
+    logger.info(
+        "GOKU REFERRAL BOT ONLINE"
+    )
+    logger.info(
+        "Reward: ₹%s per referral",
+        REWARD_PER_REFERRAL,
+    )
+    logger.info(
+        "Minimum withdrawal: ₹%s",
+        MIN_WITHDRAWAL,
+    )
+    logger.info(
+        "Required joins: %s",
+        len(REQUIRED_CHATS),
+    )
+    logger.info(
+        "========================================"
+    )
+
+    # --------------------------------------------------------
+    # START BOT
+    # --------------------------------------------------------
 
     app.run_polling(
         drop_pending_updates=True
     )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
