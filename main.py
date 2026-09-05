@@ -30,45 +30,33 @@ MIN_WITHDRAWAL = 20
 
 DB_FILE = "bot.db"
 
+
 # ============================================================
-# RAILWAY BOT TOKEN
+# BOT TOKEN
 # ============================================================
 
 def get_bot_token():
-    """
-    Railway environment variable mathi token safely read kare che.
-
-    Preferred:
-        BOT_TOKEN
-
-    Fallback:
-        TELEGRAM_BOT_TOKEN
-        TOKEN
-
-    Case/space issue hoy to matching key pan try kare che.
-    """
-
-    possible_names = [
+    names = [
         "BOT_TOKEN",
         "TELEGRAM_BOT_TOKEN",
         "TOKEN",
     ]
 
-    # Normal lookup
-    for name in possible_names:
+    for name in names:
         value = os.getenv(name)
+
         if value:
-            value = value.strip()
+            value = value.strip().strip('"').strip("'")
+
             if value:
                 return value
 
-    # Extra fallback:
-    # Jo Railway variable name ma accidental lowercase/space hoy
     for key, value in os.environ.items():
         normalized = key.strip().upper()
 
-        if normalized in possible_names:
+        if normalized in names:
             value = (value or "").strip()
+            value = value.strip('"').strip("'")
 
             if value:
                 return value
@@ -81,6 +69,7 @@ BOT_TOKEN = get_bot_token()
 
 # ============================================================
 # REQUIRED CHANNELS / GROUPS
+# CHAT IDs SAME RAKHYA CHE
 # ============================================================
 
 REQUIRED_CHATS = [
@@ -126,7 +115,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-logger = logging.getLogger("referral_bot")
+logger = logging.getLogger("GOKU_REFERRAL")
 
 
 # ============================================================
@@ -336,7 +325,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-
 BACK_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["⬅️ Back"],
@@ -376,31 +364,65 @@ def join_keyboard():
 # MEMBERSHIP CHECK
 # ============================================================
 
-async def is_member(
+async def check_one_chat(
     bot,
     user_id,
-    chat_id,
+    chat,
 ):
+    """
+    Ek-ek channel/GC check kare che.
+
+    Returns:
+        True  = joined
+        False = not joined / API error
+    """
 
     try:
 
         member = await bot.get_chat_member(
-            chat_id=chat_id,
+            chat_id=chat["chat_id"],
             user_id=user_id,
         )
 
-        return member.status in {
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        }
+        status = member.status
+
+        logger.info(
+            "CHECK | %s | user=%s | status=%s",
+            chat["name"],
+            user_id,
+            status,
+        )
+
+        # Normal member
+        if status == ChatMemberStatus.MEMBER:
+            return True
+
+        # Admin
+        if status == ChatMemberStatus.ADMINISTRATOR:
+            return True
+
+        # Owner / creator
+        if status == ChatMemberStatus.OWNER:
+            return True
+
+        # Restricted but still member
+        if status == ChatMemberStatus.RESTRICTED:
+            return bool(
+                getattr(
+                    member,
+                    "is_member",
+                    False,
+                )
+            )
+
+        # LEFT / KICKED
+        return False
 
     except Exception as exc:
 
         logger.warning(
-            "Membership check failed | "
-            "chat=%s | user=%s | %s",
-            chat_id,
+            "CHECK FAILED | %s | user=%s | error=%s",
+            chat["name"],
             user_id,
             exc,
         )
@@ -408,23 +430,33 @@ async def is_member(
         return False
 
 
-async def all_required_joined(
+# ============================================================
+# IMPORTANT:
+# EXACT MISSING CHANNEL / GC RETURN KARSE
+# ============================================================
+
+async def get_not_joined_chats(
     bot,
     user_id,
 ):
 
+    not_joined = []
+
     for chat in REQUIRED_CHATS:
 
-        joined = await is_member(
+        joined = await check_one_chat(
             bot,
             user_id,
-            chat["chat_id"],
+            chat,
         )
 
         if not joined:
-            return False
 
-    return True
+            not_joined.append(
+                chat["name"]
+            )
+
+    return not_joined
 
 
 # ============================================================
@@ -436,13 +468,17 @@ def extract_referrer(args):
     if not args:
         return None
 
-    value = str(args[0]).strip().upper()
+    value = str(
+        args[0]
+    ).strip().upper()
 
     if not value.startswith("REF"):
         return None
 
     try:
-        return int(value[3:])
+        return int(
+            value[3:]
+        )
     except ValueError:
         return None
 
@@ -454,15 +490,36 @@ def extract_referrer(args):
 async def send_join_screen(
     update,
     context,
+    missing=None,
 ):
 
-    text = (
-        "🔒 *MUST JOIN ALL*\n\n"
-        "Bot use karva pela badha required "
-        "channels/groups join karo.\n\n"
-        "Badha join karya pachhi niche "
-        "*Verify Joined* dabavo."
-    )
+    if missing is None:
+        missing = []
+
+    if missing:
+
+        missing_text = "\n".join(
+            f"❌ {name}"
+            for name in missing
+        )
+
+        text = (
+            "🔒 *MUST JOIN ALL*\n\n"
+            "Tame aa chats join nathi karya:\n\n"
+            f"{missing_text}\n\n"
+            "Badha join karya pachhi "
+            "✅ *Verify Joined* dabavo."
+        )
+
+    else:
+
+        text = (
+            "🔒 *MUST JOIN ALL*\n\n"
+            "Bot use karva pela badha required "
+            "channels/groups join karo.\n\n"
+            "Badha join karya pachhi "
+            "✅ *Verify Joined* dabavo."
+        )
 
     if update.callback_query:
 
@@ -520,21 +577,29 @@ async def start(
 
     context.user_data.clear()
 
-    joined = await all_required_joined(
+    # ========================================================
+    # CHECK EACH CHAT
+    # ========================================================
+
+    missing = await get_not_joined_chats(
         context.bot,
         user.id,
     )
 
-    if not joined:
+    if missing:
 
         await send_join_screen(
             update,
             context,
+            missing,
         )
 
         return
 
-    # Referral reward
+    # ========================================================
+    # REFERRAL REWARD
+    # ========================================================
+
     if existing["referred_by"]:
 
         rewarded = add_referral_reward(
@@ -582,34 +647,62 @@ async def verify_join(
 
     query = update.callback_query
 
-    await query.answer()
-
-    joined = await all_required_joined(
-        context.bot,
-        query.from_user.id,
+    await query.answer(
+        "Checking all channels/groups..."
     )
 
-    if not joined:
+    user_id = query.from_user.id
 
-        await query.message.reply_text(
-            "❌ Badha required "
-            "channels/groups join nathi karya.\n\n"
-            "Please badha 6 join kari ne "
-            "fari Verify Joined dabavo.",
+    # ========================================================
+    # CHECK EVERY CHAT
+    # ========================================================
+
+    missing = await get_not_joined_chats(
+        context.bot,
+        user_id,
+    )
+
+    # ========================================================
+    # STILL MISSING
+    # ========================================================
+
+    if missing:
+
+        missing_text = "\n".join(
+            f"❌ {name}"
+            for name in missing
+        )
+
+        text = (
+            "❌ *Verification Failed*\n\n"
+            "Tame aa chats join nathi karya:\n\n"
+            f"{missing_text}\n\n"
+            "👉 Pela aa badha join karo.\n"
+            "👉 Pachhi fari "
+            "✅ *Verify Joined* dabavo."
+        )
+
+        await query.message.edit_text(
+            text,
+            parse_mode="Markdown",
             reply_markup=join_keyboard(),
         )
 
         return
 
+    # ========================================================
+    # ALL JOINED
+    # ========================================================
+
     user = get_user(
-        query.from_user.id
+        user_id
     )
 
     if user and user["referred_by"]:
 
         rewarded = add_referral_reward(
             user["referred_by"],
-            query.from_user.id,
+            user_id,
         )
 
         if rewarded:
@@ -628,9 +721,62 @@ async def verify_join(
             except Exception:
                 pass
 
+    await query.message.edit_text(
+        "🎉 *Verification Successful!*\n\n"
+        "✅ Main Channel\n"
+        "✅ Main GC\n"
+        "✅ Second Channel\n"
+        "✅ Second GC\n"
+        "✅ Last Channel\n"
+        "✅ Last GC\n\n"
+        "🔥 *Badha 6 joined che!*",
+        parse_mode="Markdown",
+    )
+
     await query.message.reply_text(
-        "✅ *Verification successful!*\n\n"
-        "🏠 Main menu open thai gayu.",
+        "🏠 *Main Menu*",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# ============================================================
+# /VERIFY
+# ============================================================
+
+async def verify_command(
+    update,
+    context,
+):
+
+    user_id = update.effective_user.id
+
+    missing = await get_not_joined_chats(
+        context.bot,
+        user_id,
+    )
+
+    if missing:
+
+        missing_text = "\n".join(
+            f"❌ {name}"
+            for name in missing
+        )
+
+        await update.message.reply_text(
+            "❌ *Verification Failed*\n\n"
+            "Still aa chats missing che:\n\n"
+            f"{missing_text}\n\n"
+            "Badha join kari ne fari verify karo.",
+            parse_mode="Markdown",
+            reply_markup=join_keyboard(),
+        )
+
+        return
+
+    await update.message.reply_text(
+        "✅ *Verification Successful!*\n\n"
+        "Badha 6 channels/groups joined che.",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -675,9 +821,9 @@ async def refer_friend(
         f"👤 Successful referral = "
         f"+{REWARD_PER_REFERRAL} point "
         f"(₹{REWARD_PER_REFERRAL})\n\n"
-        "⚠️ Reward tyare j credit thashe "
-        "jyare referred user badha required "
-        "joins complete kare."
+        "⚠️ Reward referred user na "
+        "badha required joins complete "
+        "thaya pachhi credit thashe."
     )
 
     await update.message.reply_text(
@@ -786,12 +932,9 @@ async def help_menu(
 
     await update.message.reply_text(
         "🆘 *Help*\n\n"
-        "👥 Refer Friend → "
-        "Personal referral link male.\n"
-        "💰 Points → "
-        "Balance ane referrals check karo.\n"
-        f"💸 Withdrawal → "
-        f"Minimum ₹{MIN_WITHDRAWAL}.\n\n"
+        "👥 Refer Friend → Personal referral link.\n"
+        "💰 Points → Balance ane referrals.\n"
+        f"💸 Withdrawal → Minimum ₹{MIN_WITHDRAWAL}.\n\n"
         "Referral reward successful "
         "join verification pachhi credit thay che.",
         parse_mode="Markdown",
@@ -817,7 +960,10 @@ async def handle_text(
 
     user_id = update.effective_user.id
 
-    # Menu
+    # --------------------------------------------------------
+    # MENU
+    # --------------------------------------------------------
+
     if text == "👥 Refer Friend":
 
         await refer_friend(
@@ -913,7 +1059,6 @@ async def handle_text(
         conn = db()
         cur = conn.cursor()
 
-        # Atomically reserve balance
         cur.execute(
             """
             UPDATE users
@@ -979,10 +1124,6 @@ async def handle_text(
             parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
-
-        # ====================================================
-        # ADMIN BUTTONS
-        # ====================================================
 
         admin_keyboard = InlineKeyboardMarkup(
             [
@@ -1068,8 +1209,13 @@ async def withdrawal_action(
     action = parts[1]
 
     try:
-        withdrawal_id = int(parts[2])
+
+        withdrawal_id = int(
+            parts[2]
+        )
+
     except ValueError:
+
         return
 
     conn = db()
@@ -1172,7 +1318,6 @@ async def withdrawal_action(
             ),
         )
 
-        # Return reserved points
         conn.execute(
             """
             UPDATE users
@@ -1230,22 +1375,18 @@ async def error_handler(
 
 def main():
 
-    # --------------------------------------------------------
-    # TOKEN CHECK
-    # --------------------------------------------------------
-
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "\n"
-            "BOT TOKEN NOT FOUND!\n\n"
-            "Railway Variables ma aa exact variable add karo:\n"
-            "BOT_TOKEN = YOUR_NEW_BOTFATHER_TOKEN\n\n"
-            "Pachhi NEW DEPLOYMENT / REDEPLOY karo.\n"
+            "BOT_TOKEN environment variable missing."
         )
 
-    # Token accidentally wrapped in quotes hoy to clean
-    token = BOT_TOKEN.strip().strip('"').strip("'")
+    token = (
+        BOT_TOKEN
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
 
     if not token:
 
@@ -1253,19 +1394,7 @@ def main():
             "BOT_TOKEN is empty."
         )
 
-    logger.info(
-        "BOT_TOKEN loaded successfully."
-    )
-
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
-
     init_db()
-
-    # --------------------------------------------------------
-    # TELEGRAM APPLICATION
-    # --------------------------------------------------------
 
     app = (
         Application
@@ -1282,7 +1411,15 @@ def main():
         )
     )
 
-    # Verify Joined
+    # /verify
+    app.add_handler(
+        CommandHandler(
+            "verify",
+            verify_command,
+        )
+    )
+
+    # Verify Joined button
     app.add_handler(
         CallbackQueryHandler(
             verify_join,
@@ -1290,7 +1427,7 @@ def main():
         )
     )
 
-    # Admin withdrawal
+    # Withdrawal buttons
     app.add_handler(
         CallbackQueryHandler(
             withdrawal_action,
@@ -1298,7 +1435,7 @@ def main():
         )
     )
 
-    # Text/menu
+    # Text messages
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1306,7 +1443,6 @@ def main():
         )
     )
 
-    # Errors
     app.add_error_handler(
         error_handler
     )
@@ -1314,28 +1450,29 @@ def main():
     logger.info(
         "========================================"
     )
+
     logger.info(
         "GOKU REFERRAL BOT ONLINE"
     )
+
     logger.info(
-        "Reward: ₹%s per referral",
+        "Required chats: %d",
+        len(REQUIRED_CHATS),
+    )
+
+    logger.info(
+        "Reward: ₹%s",
         REWARD_PER_REFERRAL,
     )
+
     logger.info(
         "Minimum withdrawal: ₹%s",
         MIN_WITHDRAWAL,
     )
-    logger.info(
-        "Required joins: %s",
-        len(REQUIRED_CHATS),
-    )
+
     logger.info(
         "========================================"
     )
-
-    # --------------------------------------------------------
-    # START BOT
-    # --------------------------------------------------------
 
     app.run_polling(
         drop_pending_updates=True
