@@ -91,7 +91,7 @@ REQUIRED_CHATS = [
     },
     {
         "name": "Main GC",
-        "join_url": "https://t.me/GOKUPROFITZONE",
+        "join_url": "https://t.me/+si63pZE9oqg3MTdl",
         "chat_id": "-1003709273961",
     },
     {
