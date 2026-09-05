@@ -101,8 +101,8 @@ REQUIRED_CHATS = [
     },
     {
         "name": "Second GC",
-        "join_url": "https://t.me/+Ld0qauMMtjowNzg1",
-        "chat_id": "-1003720001493",
+        "join_url": "https://t.me/+GJDIGLvRE9g1ZDJl",
+        "chat_id": "-5496288479",
     },
     {
         "name": "Last Channel",
