@@ -34,7 +34,7 @@ REQUIRED_CHATS = [
     {"name": "Main Channel", "join_url": "https://t.me/+CvMzUOQFDiczNjZl", "chat_id": "-1003540916448"},
     {"name": "Main GC", "join_url": "https://t.me/+si63pZE9oqg3MTdl", "chat_id": "-1003709273961"},
     {"name": "Second Channel", "join_url": "https://t.me/+727mMnMYUdJhMDZl", "chat_id": "-1004318439063"},
-    {"name": "Second GC", "join_url": "https://t.me/+GJDIGLvRE9g1ZDJl", "chat_id": "-5496288479"},
+    {"name": "Second GC", "join_url": "https://t.me/+GJDIGLvRE9g1ZDJl", "chat_id": "-1004405504432"},
     {"name": "Last Channel", "join_url": "https://t.me/lxmodemenu", "chat_id": "@lxmodemenu"},
     {"name": "Last GC", "join_url": "https://t.me/+oY2-2veF8zU5NzY9", "chat_id": "-1004437059817"},
 ]
