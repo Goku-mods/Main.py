@@ -28,7 +28,7 @@ from telegram.ext import (
 
 ADMIN_ID = 8754266926
 
-REWARD_PER_REFERRAL = 1
+REWARD_PER_REFERRAL = 2
 MIN_WITHDRAWAL = 10
 
 DB_FILE = "bot.db"
@@ -85,19 +85,9 @@ REQUIRED_CHATS = [
         "chat_id": "-1004318439063",
     },
     {
-        "name": "Second GC",
-        "join_url": "https://t.me/+qZ7f2tWQEuZmMWNl",
-        "chat_id": "-1003720001493",
-    },
-    {
         "name": "Last Channel",
         "join_url": "https://t.me/lxmodemenu",
         "chat_id": "@lxmodemenu",
-    },
-    {
-        "name": "Last GC",
-        "join_url": "https://t.me/+oY2-2veF8zU5NzY9",
-        "chat_id": "-1004437059817",
     },
 ]
 
@@ -470,7 +460,7 @@ def join_keyboard():
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"📢 Join {chat['name']}",
+                    "JOIN",
                     url=chat["join_url"],
                 )
             ]
@@ -883,7 +873,7 @@ async def verify_join(update, context):
         return
 
     await query.answer(
-        "Checking all 6..."
+        f"Checking all {len(REQUIRED_CHATS)}..."
     )
 
     user_id = query.from_user.id
