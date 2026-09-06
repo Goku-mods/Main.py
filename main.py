@@ -229,8 +229,7 @@ def all_user_ids():
 
 async def broadcast_text(bot, text):
     """
-    Send a message to every registered user by private DM.
-    Returns (sent, failed).
+    Legacy text broadcaster. Sends plain text to every registered user.
     """
     sent = 0
     failed = 0
@@ -240,13 +239,39 @@ async def broadcast_text(bot, text):
             await bot.send_message(
                 chat_id=user_id,
                 text=text,
-                parse_mode="HTML",
             )
             sent += 1
         except Exception as exc:
             failed += 1
             logger.warning(
                 "Broadcast failed | user=%s | %s",
+                user_id,
+                exc,
+            )
+
+    return sent, failed
+
+
+async def broadcast_message(bot, source_chat_id, message_id):
+    """
+    Copy the admin's message to every registered user.
+    This supports text, photo, video, document, audio, sticker, etc.
+    """
+    sent = 0
+    failed = 0
+
+    for user_id in all_user_ids():
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=message_id,
+            )
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "Broadcast copy failed | user=%s | %s",
                 user_id,
                 exc,
             )
@@ -1485,6 +1510,47 @@ async def help_menu(update, context):
 # MENU BUTTONS ARE HANDLED BEFORE JOIN GATE
 # ============================================================
 
+async def handle_any_message(update, context):
+    """
+    Routes every non-command private message.
+    If admin is in broadcast mode, copy the exact message to all
+    registered users. Otherwise keep the existing text flow.
+    """
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or chat.type != "private":
+        return
+
+    if (
+        user
+        and user.id == ADMIN_ID
+        and context.user_data.get("admin_broadcast") is True
+    ):
+        context.user_data.pop("admin_broadcast", None)
+
+        sent, failed = await broadcast_message(
+            context.bot,
+            chat.id,
+            update.message.message_id,
+        )
+
+        await update.message.reply_text(
+            "📢 Broadcast Finished\n\n"
+            f"✅ Sent: {sent}\n"
+            f"❌ Failed: {failed}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # Preserve the existing bot behaviour for normal text messages.
+    if update.message.text:
+        await handle_text(update, context)
+
+
 async def handle_text(update, context):
     if (
         not update.message
@@ -1525,10 +1591,9 @@ async def handle_text(update, context):
         )
 
         await update.message.reply_text(
-            "📢 <b>Broadcast Finished</b>\n\n"
-            f"✅ Sent: <b>{sent}</b>\n"
-            f"❌ Failed: <b>{failed}</b>",
-            parse_mode="HTML",
+            "📢 Broadcast Finished\n\n"
+            f"✅ Sent: {sent}\n"
+            f"❌ Failed: {failed}",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -2339,11 +2404,12 @@ def main():
         )
     )
 
-    # Normal text / keyboard
+    # All normal messages / broadcast messages.
+    # Commands are handled by CommandHandler above.
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text,
+            filters.ALL & ~filters.COMMAND,
+            handle_any_message,
         )
     )
 
