@@ -29,9 +29,14 @@ from telegram.ext import (
 ADMIN_ID = 8754266926
 
 REWARD_PER_REFERRAL = 1
-MIN_WITHDRAWAL = 20
+MIN_WITHDRAWAL = 10
 
 DB_FILE = "bot.db"
+
+# Bot-wide maintenance mode.
+# 0 = live, 1 = maintenance.
+MAINTENANCE_KEY = "maintenance"
+
 
 
 # ============================================================
@@ -153,6 +158,18 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    cur.execute(
+        "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
+        (MAINTENANCE_KEY, "0"),
+    )
+
     cols = {
         row["name"]
         for row in cur.execute(
@@ -167,6 +184,74 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# BOT SETTINGS / BROADCAST HELPERS
+# ============================================================
+
+def get_setting(key, default=""):
+    conn = db()
+    row = conn.execute(
+        "SELECT value FROM bot_settings WHERE key=?",
+        (key,),
+    ).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO bot_settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key, str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def maintenance_enabled():
+    return get_setting(MAINTENANCE_KEY, "0") == "1"
+
+
+def all_user_ids():
+    conn = db()
+    rows = conn.execute(
+        "SELECT user_id FROM users ORDER BY user_id"
+    ).fetchall()
+    conn.close()
+    return [int(row["user_id"]) for row in rows]
+
+
+async def broadcast_text(bot, text):
+    """
+    Send a message to every registered user by private DM.
+    Returns (sent, failed).
+    """
+    sent = 0
+    failed = 0
+
+    for user_id in all_user_ids():
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "Broadcast failed | user=%s | %s",
+                user_id,
+                exc,
+            )
+
+    return sent, failed
 
 
 # ============================================================
@@ -381,6 +466,22 @@ def join_keyboard():
 def admin_keyboard():
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "📢 Broadcast",
+                    callback_data="admin_broadcast",
+                ),
+                InlineKeyboardButton(
+                    "🔧 Maintenance",
+                    callback_data="admin_maintenance",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🟢 Live Now",
+                    callback_data="admin_live",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     "📥 Pending Requests",
@@ -638,13 +739,57 @@ async def maybe_reward_user(
 
 
 # ============================================================
+# MAINTENANCE GATE
+# ============================================================
+
+async def maintenance_gate(update, context):
+    """
+    Returns True when the current non-admin user is blocked by
+    maintenance mode. Admin is always allowed through.
+    """
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    if user.id == ADMIN_ID:
+        return False
+
+    if not maintenance_enabled():
+        return False
+
+    # Never send maintenance replies into groups.
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        return True
+
+    message = getattr(update, "message", None)
+    if message:
+        await message.reply_text(
+            "🔧 <b>Bot Maintenance</b>\n\n"
+            "The bot is currently under maintenance.\n"
+            "Please try again later.",
+            parse_mode="HTML",
+        )
+
+    return True
+
+
+# ============================================================
 # START
 # ============================================================
 
 async def start(update, context):
     user = update.effective_user
 
-    if not user or not update.message:
+    if (
+        not user
+        or not update.message
+        or update.effective_chat.type != "private"
+    ):
+        return
+
+    if await maintenance_gate(update, context):
         return
 
     referrer_id = extract_referrer(
@@ -703,6 +848,15 @@ async def start(update, context):
 async def verify_join(update, context):
     query = update.callback_query
 
+    if (
+        not query
+        or not query.message
+        or query.message.chat.type != "private"
+    ):
+        if query:
+            await query.answer()
+        return
+
     await query.answer(
         "Checking all 6..."
     )
@@ -751,14 +905,7 @@ async def verify_join(update, context):
     )
 
     await query.message.edit_text(
-        "🎉 <b>Verification Successful!</b>\n\n"
-        "✅ Main Channel\n"
-        "✅ Main GC\n"
-        "✅ Second Channel\n"
-        "✅ Second GC\n"
-        "✅ Last Channel\n"
-        "✅ Last GC\n\n"
-        "🔥 <b>All 6 joins verified!</b>",
+        "🎉 <b>Verification Successful!</b>",
         parse_mode="HTML",
     )
 
@@ -774,8 +921,31 @@ async def verify_join(update, context):
 # /VERIFY
 # ============================================================
 
+async def cancel_command(update, context):
+    if (
+        not update.message
+        or update.effective_chat.type != "private"
+    ):
+        return
+
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    context.user_data.pop("admin_broadcast", None)
+    await update.message.reply_text(
+        "❌ Cancelled.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
 async def verify_command(update, context):
-    if not update.message:
+    if (
+        not update.message
+        or update.effective_chat.type != "private"
+    ):
+        return
+
+    if await maintenance_gate(update, context):
         return
 
     missing, _ = await gate_user(
@@ -1199,6 +1369,15 @@ async def withdrawal_callback(
 ):
     query = update.callback_query
 
+    if (
+        not query
+        or not query.message
+        or query.message.chat.type != "private"
+    ):
+        if query:
+            await query.answer()
+        return
+
     await query.answer()
 
     if query.data == "wd_cancel":
@@ -1307,7 +1486,13 @@ async def help_menu(update, context):
 # ============================================================
 
 async def handle_text(update, context):
-    if not update.message:
+    if (
+        not update.message
+        or update.effective_chat.type != "private"
+    ):
+        return
+
+    if await maintenance_gate(update, context):
         return
 
     user = update.effective_user
@@ -1318,6 +1503,35 @@ async def handle_text(update, context):
     text = (
         update.message.text or ""
     ).strip()
+
+    # --------------------------------------------------------
+    # ADMIN BROADCAST INPUT
+    # --------------------------------------------------------
+    if (
+        user.id == ADMIN_ID
+        and context.user_data.get("admin_broadcast") is True
+    ):
+        if not text:
+            await update.message.reply_text(
+                "❌ Broadcast message cannot be empty."
+            )
+            return
+
+        context.user_data.pop("admin_broadcast", None)
+
+        sent, failed = await broadcast_text(
+            context.bot,
+            text,
+        )
+
+        await update.message.reply_text(
+            "📢 <b>Broadcast Finished</b>\n\n"
+            f"✅ Sent: <b>{sent}</b>\n"
+            f"❌ Failed: <b>{failed}</b>",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
 
     # --------------------------------------------------------
     # BACK ALWAYS WORKS
@@ -1565,8 +1779,17 @@ async def admin_command(update, context):
         )
         return
 
+    context.user_data.pop("admin_broadcast", None)
+
+    status = (
+        "🔧 Maintenance: <b>ON</b>"
+        if maintenance_enabled()
+        else "🟢 Status: <b>LIVE</b>"
+    )
+
     await update.message.reply_text(
         "🛠 <b>Admin Panel</b>\n\n"
+        f"{status}\n\n"
         "Choose an option:",
         parse_mode="HTML",
         reply_markup=admin_keyboard(),
@@ -1643,6 +1866,15 @@ def admin_referrals_text(limit=30):
 async def admin_callback(update, context):
     query = update.callback_query
 
+    if (
+        not query
+        or not query.message
+        or query.message.chat.type != "private"
+    ):
+        if query:
+            await query.answer()
+        return
+
     if query.from_user.id != ADMIN_ID:
         await query.answer(
             "Admin only.",
@@ -1651,6 +1883,56 @@ async def admin_callback(update, context):
         return
 
     await query.answer()
+
+    if query.data == "admin_broadcast":
+        context.user_data["admin_broadcast"] = True
+        await query.message.reply_text(
+            "📢 <b>Broadcast Mode</b>\n\n"
+            "Send the message you want to deliver to "
+            "<b>all registered members</b> by DM.\n\n"
+            "Send <code>/cancel</code> to cancel.",
+            parse_mode="HTML",
+            reply_markup=BACK_KEYBOARD,
+        )
+        return
+
+    if query.data == "admin_maintenance":
+        enabled = maintenance_enabled()
+
+        if enabled:
+            set_setting(MAINTENANCE_KEY, "0")
+            await query.message.reply_text(
+                "🟢 <b>Maintenance OFF</b>\n\n"
+                "Bot is live again.",
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(),
+            )
+        else:
+            set_setting(MAINTENANCE_KEY, "1")
+            await query.message.reply_text(
+                "🔧 <b>Maintenance ON</b>\n\n"
+                "Members will see the maintenance message "
+                "and normal bot functions are blocked.",
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(),
+            )
+        return
+
+    if query.data == "admin_live":
+        sent, failed = await broadcast_text(
+            context.bot,
+            "🟢 <b>GOKU BOT IS LIVE NOW!</b>\n\n"
+            "The bot is online and ready to use. 🔥",
+        )
+
+        await query.message.reply_text(
+            "🟢 <b>Live Now Broadcast Finished</b>\n\n"
+            f"✅ Sent: <b>{sent}</b>\n"
+            f"❌ Failed: <b>{failed}</b>",
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(),
+        )
+        return
 
     if query.data == "admin_pending":
 
@@ -1778,6 +2060,15 @@ async def admin_withdrawal_action(
     context,
 ):
     query = update.callback_query
+
+    if (
+        not query
+        or not query.message
+        or query.message.chat.type != "private"
+    ):
+        if query:
+            await query.answer()
+        return
 
     if query.from_user.id != ADMIN_ID:
         await query.answer(
@@ -1996,6 +2287,13 @@ def main():
 
     app.add_handler(
         CommandHandler(
+            "cancel",
+            cancel_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
             "admin",
             admin_command,
         )
@@ -2021,7 +2319,7 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             admin_callback,
-            pattern=r"^admin_(pending|all|completed|stats|users|referrals)$",
+            pattern=r"^admin_(broadcast|maintenance|live|pending|all|completed|stats|users|referrals)$",
         )
     )
 
@@ -2070,6 +2368,10 @@ def main():
     logger.info(
         "Minimum withdrawal: ₹%s",
         MIN_WITHDRAWAL,
+    )
+    logger.info(
+        "Maintenance: %s",
+        "ON" if maintenance_enabled() else "OFF",
     )
     logger.info(
         "========================================"
