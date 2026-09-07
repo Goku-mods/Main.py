@@ -1,8 +1,17 @@
 import os
 import re
+import json
 import sqlite3
 import logging
 from datetime import datetime, timezone
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db as firebase_db
+except ImportError:
+    firebase_admin = None
+    credentials = None
+    firebase_db = None
 
 from telegram import (
     Update,
@@ -64,6 +73,296 @@ BOT_TOKEN = get_bot_token()
 
 
 # ============================================================
+# FIREBASE BACKUP / SYNC
+# ============================================================
+
+FIREBASE_DATABASE_URL = "https://saiyan-v2-838a5-default-rtdb.firebaseio.com"
+FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+FIREBASE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+FIREBASE_ENABLED = False
+
+
+def init_firebase():
+    """Initialize Firebase Admin SDK using a service-account JSON/file.
+
+    The Firebase Web API key is intentionally NOT used for server writes.
+    Keep the service-account credentials in your hosting environment.
+    """
+    global FIREBASE_ENABLED
+
+    if firebase_admin is None:
+        logger.warning("firebase-admin is not installed; Firebase backup disabled.")
+        return False
+
+    if firebase_admin._apps:
+        FIREBASE_ENABLED = True
+        return True
+
+    try:
+        if FIREBASE_SERVICE_ACCOUNT_JSON:
+            info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+            cred = credentials.Certificate(info)
+        elif FIREBASE_SERVICE_ACCOUNT_FILE:
+            cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_FILE)
+        else:
+            logger.error(
+                "Firebase credentials missing. Set FIREBASE_SERVICE_ACCOUNT_JSON "
+                "or GOOGLE_APPLICATION_CREDENTIALS. Firebase backup is disabled."
+            )
+            return False
+
+        firebase_admin.initialize_app(
+            cred,
+            {"databaseURL": FIREBASE_DATABASE_URL},
+        )
+        FIREBASE_ENABLED = True
+        logger.info("Firebase backup connected: %s", FIREBASE_DATABASE_URL)
+        return True
+    except Exception as exc:
+        FIREBASE_ENABLED = False
+        logger.exception("Firebase initialization failed: %s", exc)
+        return False
+
+
+def firebase_ref(path):
+    if not FIREBASE_ENABLED:
+        return None
+    return firebase_db.reference(path)
+
+
+def firebase_safe_set(path, data):
+    """Write to Firebase without ever crashing the Telegram bot."""
+    if not FIREBASE_ENABLED:
+        return False
+    try:
+        firebase_ref(path).set(data)
+        return True
+    except Exception as exc:
+        logger.error("Firebase write failed | %s | %s", path, exc)
+        return False
+
+
+def firebase_get(path, default=None):
+    if not FIREBASE_ENABLED:
+        return default
+    try:
+        value = firebase_ref(path).get()
+        return default if value is None else value
+    except Exception as exc:
+        logger.error("Firebase read failed | %s | %s", path, exc)
+        return default
+
+
+def firebase_user_dict(row):
+    return {
+        "user_id": int(row["user_id"]),
+        "username": row["username"] or "",
+        "first_name": row["first_name"] or "",
+        "points": int(row["points"] or 0),
+        "referral_code": row["referral_code"],
+        "referred_by": int(row["referred_by"]) if row["referred_by"] is not None else None,
+        "referral_paid": int(row["referral_paid"] or 0),
+        "upi_id": row["upi_id"] or "",
+        "joined_at": row["joined_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def firebase_withdrawal_dict(row):
+    return {
+        "id": int(row["id"]),
+        "user_id": int(row["user_id"]),
+        "amount": int(row["amount"]),
+        "upi_id": row["upi_id"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "processed_at": row["processed_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def firebase_save_user_by_id(user_id):
+    row = get_user(user_id)
+    if not row:
+        return False
+    return firebase_safe_set(
+        f"users/{int(user_id)}",
+        firebase_user_dict(row),
+    )
+
+
+def firebase_save_withdrawal_by_id(withdrawal_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM withdrawals WHERE id=?",
+        (withdrawal_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return firebase_safe_set(
+        f"withdrawals/{int(withdrawal_id)}",
+        firebase_withdrawal_dict(row),
+    )
+
+
+def _parse_time(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def sync_sqlite_and_firebase():
+    """Two-way startup sync. Newer records win; Firebase-only users are restored.
+
+    This is the important recovery layer: if the hosting machine loses bot.db,
+    the next start can rebuild users/referrals/UPI/withdrawals from Firebase.
+    """
+    if not FIREBASE_ENABLED:
+        return
+
+    try:
+        remote_users = firebase_get("users", {}) or {}
+        remote_withdrawals = firebase_get("withdrawals", {}) or {}
+
+        conn = db()
+        local_users = conn.execute("SELECT * FROM users").fetchall()
+        local_withdrawals = conn.execute("SELECT * FROM withdrawals").fetchall()
+
+        local_user_ids = set()
+        for row in local_users:
+            uid = str(row["user_id"])
+            local_user_ids.add(uid)
+            remote = remote_users.get(uid) if isinstance(remote_users, dict) else None
+
+            if not remote:
+                firebase_safe_set(f"users/{uid}", firebase_user_dict(row))
+                continue
+
+            local_time = _parse_time(row["updated_at"])
+            remote_time = _parse_time(remote.get("updated_at", ""))
+
+            if remote_time > local_time:
+                conn.execute(
+                    """
+                    UPDATE users SET
+                        username=?, first_name=?, points=?, referral_code=?,
+                        referred_by=?, referral_paid=?, upi_id=?, joined_at=?, updated_at=?
+                    WHERE user_id=?
+                    """,
+                    (
+                        remote.get("username", ""),
+                        remote.get("first_name", ""),
+                        int(remote.get("points", 0)),
+                        remote.get("referral_code", f"REF{uid}"),
+                        remote.get("referred_by"),
+                        int(remote.get("referral_paid", 0)),
+                        remote.get("upi_id", ""),
+                        remote.get("joined_at", now()),
+                        remote.get("updated_at", now()),
+                        int(uid),
+                    ),
+                )
+            else:
+                firebase_safe_set(f"users/{uid}", firebase_user_dict(row))
+
+        # Restore users that exist in Firebase but not on the hosting disk.
+        for uid, remote in (remote_users.items() if isinstance(remote_users, dict) else []):
+            if str(uid) in local_user_ids:
+                continue
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO users
+                    (user_id, username, first_name, points, referral_code, referred_by,
+                     referral_paid, upi_id, joined_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(uid),
+                        remote.get("username", ""),
+                        remote.get("first_name", ""),
+                        int(remote.get("points", 0)),
+                        remote.get("referral_code", f"REF{uid}"),
+                        remote.get("referred_by"),
+                        int(remote.get("referral_paid", 0)),
+                        remote.get("upi_id", ""),
+                        remote.get("joined_at", now()),
+                        remote.get("updated_at", now()),
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Could not restore Firebase user %s: %s", uid, exc)
+
+        # Withdrawals are backed up/restored too, so balances can be reconciled.
+        local_wd_ids = set()
+        for row in local_withdrawals:
+            wid = str(row["id"])
+            local_wd_ids.add(wid)
+            remote = remote_withdrawals.get(wid) if isinstance(remote_withdrawals, dict) else None
+            if not remote:
+                firebase_safe_set(f"withdrawals/{wid}", firebase_withdrawal_dict(row))
+                continue
+
+            local_time = _parse_time(row["updated_at"])
+            remote_time = _parse_time(remote.get("updated_at", ""))
+            if remote_time > local_time:
+                conn.execute(
+                    """
+                    UPDATE withdrawals SET user_id=?, amount=?, upi_id=?, status=?,
+                    created_at=?, processed_at=?, updated_at=? WHERE id=?
+                    """,
+                    (
+                        int(remote.get("user_id", 0)),
+                        int(remote.get("amount", 0)),
+                        remote.get("upi_id", ""),
+                        remote.get("status", "pending"),
+                        remote.get("created_at", now()),
+                        remote.get("processed_at"),
+                        remote.get("updated_at", now()),
+                        int(wid),
+                    ),
+                )
+            else:
+                firebase_safe_set(f"withdrawals/{wid}", firebase_withdrawal_dict(row))
+
+        for wid, remote in (remote_withdrawals.items() if isinstance(remote_withdrawals, dict) else []):
+            if str(wid) in local_wd_ids:
+                continue
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO withdrawals
+                    (id, user_id, amount, upi_id, status, created_at, processed_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(wid),
+                        int(remote.get("user_id", 0)),
+                        int(remote.get("amount", 0)),
+                        remote.get("upi_id", ""),
+                        remote.get("status", "pending"),
+                        remote.get("created_at", now()),
+                        remote.get("processed_at"),
+                        remote.get("updated_at", now()),
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Could not restore Firebase withdrawal %s: %s", wid, exc)
+
+        conn.commit()
+        conn.close()
+        logger.info(
+            "Firebase sync complete | remote users=%s | remote withdrawals=%s",
+            len(remote_users) if isinstance(remote_users, dict) else 0,
+            len(remote_withdrawals) if isinstance(remote_withdrawals, dict) else 0,
+        )
+    except Exception as exc:
+        logger.exception("Firebase startup sync failed: %s", exc)
+
+
+# ============================================================
 # REQUIRED CHANNELS / GROUPS
 # CHAT IDS ARE EXACTLY THE ONES YOU PROVIDED
 # ============================================================
@@ -88,6 +387,11 @@ REQUIRED_CHATS = [
         "name": "Last Channel",
         "join_url": "https://t.me/lxmodemenu",
         "chat_id": "@lxmodemenu",
+    },
+    {
+        "name": "New Channel",
+        "join_url": "https://t.me/+98SVstjmdf45OGQ1",
+        "chat_id": "-1002818481856",
     },
 ]
 
@@ -132,7 +436,8 @@ def init_db():
             referred_by INTEGER,
             referral_paid INTEGER NOT NULL DEFAULT 0,
             upi_id TEXT DEFAULT '',
-            joined_at TEXT NOT NULL
+            joined_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
 
@@ -144,7 +449,8 @@ def init_db():
             upi_id TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
-            processed_at TEXT
+            processed_at TEXT,
+            updated_at TEXT NOT NULL
         )
     """)
 
@@ -170,6 +476,27 @@ def init_db():
     if "upi_id" not in cols:
         cur.execute(
             "ALTER TABLE users ADD COLUMN upi_id TEXT DEFAULT ''"
+        )
+
+    if "updated_at" not in cols:
+        cur.execute(
+            "ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT ''"
+        )
+        cur.execute(
+            "UPDATE users SET updated_at=joined_at WHERE updated_at IS NULL OR updated_at=''"
+        )
+
+    wd_cols = {
+        row["name"]
+        for row in cur.execute("PRAGMA table_info(withdrawals)").fetchall()
+    }
+    if "updated_at" not in wd_cols:
+        cur.execute(
+            "ALTER TABLE withdrawals ADD COLUMN updated_at TEXT DEFAULT ''"
+        )
+        cur.execute(
+            "UPDATE withdrawals SET updated_at=COALESCE(processed_at, created_at) "
+            "WHERE updated_at IS NULL OR updated_at=''"
         )
 
     conn.commit()
@@ -202,6 +529,12 @@ def set_setting(key, value):
     )
     conn.commit()
     conn.close()
+
+    if key == MAINTENANCE_KEY and FIREBASE_ENABLED:
+        firebase_safe_set(
+            f"settings/{key}",
+            {"value": str(value), "updated_at": now()},
+        )
 
 
 def maintenance_enabled():
@@ -291,12 +624,13 @@ def create_user(tg_user, referred_by=None):
         conn.execute(
             """
             UPDATE users
-            SET username=?, first_name=?
+            SET username=?, first_name=?, updated_at=?
             WHERE user_id=?
             """,
             (
                 tg_user.username or "",
                 tg_user.first_name or "",
+                now(),
                 tg_user.id,
             ),
         )
@@ -308,6 +642,7 @@ def create_user(tg_user, referred_by=None):
         ).fetchone()
 
         conn.close()
+        firebase_save_user_by_id(tg_user.id)
         return row, False
 
     conn = db()
@@ -324,9 +659,10 @@ def create_user(tg_user, referred_by=None):
             referred_by,
             referral_paid,
             upi_id,
-            joined_at
+            joined_at,
+            updated_at
         )
-        VALUES (?, ?, ?, 0, ?, ?, 0, '', ?)
+        VALUES (?, ?, ?, 0, ?, ?, 0, '', ?, ?)
         """,
         (
             tg_user.id,
@@ -334,6 +670,7 @@ def create_user(tg_user, referred_by=None):
             tg_user.first_name or "",
             f"REF{tg_user.id}",
             referred_by,
+            now(),
             now(),
         ),
     )
@@ -347,17 +684,19 @@ def create_user(tg_user, referred_by=None):
 
     conn.close()
 
+    firebase_save_user_by_id(tg_user.id)
     return row, True
 
 
 def set_upi(user_id, upi):
     conn = db()
     conn.execute(
-        "UPDATE users SET upi_id=? WHERE user_id=?",
-        (upi, user_id),
+        "UPDATE users SET upi_id=?, updated_at=? WHERE user_id=?",
+        (upi, now(), user_id),
     )
     conn.commit()
     conn.close()
+    firebase_save_user_by_id(user_id)
 
 
 # ============================================================
@@ -395,23 +734,27 @@ def add_referral_reward(referrer_id, referred_id):
     cur.execute(
         """
         UPDATE users
-        SET points=points+?
+        SET points=points+?, updated_at=?
         WHERE user_id=?
         """,
-        (REWARD_PER_REFERRAL, referrer_id),
+        (REWARD_PER_REFERRAL, now(), referrer_id),
     )
 
     cur.execute(
         """
         UPDATE users
-        SET referral_paid=1
+        SET referral_paid=1, updated_at=?
         WHERE user_id=?
         """,
-        (referred_id,),
+        (now(), referred_id),
     )
 
     conn.commit()
     conn.close()
+
+    # Backup BOTH sides of the referral transaction immediately.
+    firebase_save_user_by_id(referrer_id)
+    firebase_save_user_by_id(referred_id)
 
     return True
 
@@ -981,7 +1324,7 @@ async def verify_command(update, context):
     )
 
     await update.message.reply_text(
-        "✅ <b>All 6 required joins are verified.</b>",
+        "✅ <b>All required joins are verified.</b>",
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -1285,12 +1628,13 @@ async def create_withdrawal(
     cur.execute(
         """
         UPDATE users
-        SET points=points-?
+        SET points=points-?, updated_at=?
         WHERE user_id=?
         AND points>=?
         """,
         (
             amount,
+            now(),
             user_id,
             amount,
         ),
@@ -1309,14 +1653,16 @@ async def create_withdrawal(
             amount,
             upi_id,
             status,
-            created_at
+            created_at,
+            updated_at
         )
-        VALUES (?, ?, ?, 'pending', ?)
+        VALUES (?, ?, ?, 'pending', ?, ?)
         """,
         (
             user_id,
             amount,
             upi,
+            now(),
             now(),
         ),
     )
@@ -1325,6 +1671,9 @@ async def create_withdrawal(
 
     conn.commit()
     conn.close()
+
+    firebase_save_user_by_id(user_id)
+    firebase_save_withdrawal_by_id(withdrawal_id)
 
     try:
         admin_keyboard_local = InlineKeyboardMarkup(
@@ -2187,11 +2536,13 @@ async def admin_withdrawal_action(
             UPDATE withdrawals
             SET
                 status='completed',
-                processed_at=?
+                processed_at=?,
+                updated_at=?
             WHERE id=?
             AND status='pending'
             """,
             (
+                now(),
                 now(),
                 withdrawal_id,
             ),
@@ -2209,6 +2560,7 @@ async def admin_withdrawal_action(
         ).fetchone()
 
         conn.close()
+        firebase_save_withdrawal_by_id(withdrawal_id)
 
         await query.edit_message_text(
             "✅ <b>Withdrawal Completed</b>\n\n"
@@ -2242,11 +2594,13 @@ async def admin_withdrawal_action(
             UPDATE withdrawals
             SET
                 status='rejected',
-                processed_at=?
+                processed_at=?,
+                updated_at=?
             WHERE id=?
             AND status='pending'
             """,
             (
+                now(),
                 now(),
                 withdrawal_id,
             ),
@@ -2256,17 +2610,20 @@ async def admin_withdrawal_action(
         conn.execute(
             """
             UPDATE users
-            SET points=points+?
+            SET points=points+?, updated_at=?
             WHERE user_id=?
             """,
             (
                 row["amount"],
+                now(),
                 row["user_id"],
             ),
         )
 
         conn.commit()
         conn.close()
+        firebase_save_withdrawal_by_id(withdrawal_id)
+        firebase_save_user_by_id(row["user_id"])
 
         await query.edit_message_text(
             "❌ <b>Withdrawal Rejected</b>\n\n"
@@ -2317,6 +2674,8 @@ def main():
         )
 
     init_db()
+    init_firebase()
+    sync_sqlite_and_firebase()
 
     app = (
         Application
